@@ -1,61 +1,22 @@
-#define _GNU_SOURCE
-#include <sys/types.h>
-#include <fcntl.h>
-#include <error.h>
-#include <sys/socket.h>
-#include <sys/mman.h>
-#include <sys/resource.h>
-#include <unistd.h>
-#include <string.h>
-#include <stdlib.h>
-#include <stdio.h>
-#include <errno.h>
-#include <time.h>
-#include <sys/time.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <poll.h>
-#include <linux/tcp.h>
-#include <assert.h>
+#include "common.h"
 
-#ifndef MSG_ZEROCOPY
-#define MSG_ZEROCOPY    0x4000000
-#endif
-
-#ifndef min
-#define min(a, b)  ((a) < (b) ? (a) : (b))
-#endif
-
-#define MSS 4108
-#define FILE_SZ (1ULL << 35)
 
 static size_t map_align;
-static int cfg_family = AF_INET6;
-static socklen_t cfg_alen = sizeof(struct sockaddr_in6);
-static size_t chunk_size  = 512*1024;
 int *device_array;
-unsigned int size;
+unsigned long long size;
+int copy_from_user_buffer = 0;
 
-static void *mmap_large_buffer(size_t need, size_t *allocated)
+static uint32_t tcp_info_get_rcv_mss(int fd)
 {
-	void *buffer;
-	size_t sz;
+	socklen_t sz = sizeof(struct tcp_info);
+	struct tcp_info info;
 
-	/* Attempt to use huge pages if possible. */
-	sz = ALIGN_UP(need, map_align);
-	buffer = mmap(NULL, sz, PROT_READ | PROT_WRITE,
-		      MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB, -1, 0);
-
-	if (buffer == (void *)-1) {
-		sz = need;
-		buffer = mmap(NULL, sz, PROT_READ | PROT_WRITE,
-			      MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE,
-			      -1, 0);
-		if (buffer != (void *)-1)
-			fprintf(stderr, "MAP_HUGETLB attempt failed, look at /sys/kernel/mm/hugepages for optimal performance\n");
+	if (getsockopt(fd, IPPROTO_TCP, TCP_INFO, &info, &sz)) {
+		fprintf(stderr, "Error fetching TCP_INFO\n");
+		return 0;
 	}
-	*allocated = sz;
-	return buffer;
+
+	return info.tcpi_rcv_mss;
 }
 
 void mmap_and_read(int fd)
@@ -64,7 +25,6 @@ void mmap_and_read(int fd)
 	struct tcp_zerocopy_receive zc;
 	unsigned char *buffer = NULL;
 	unsigned long delta_usec;
-	EVP_MD_CTX *ctx = NULL;
 	struct timeval t0, t1;
 	void *raddr = NULL;
 	void *addr = NULL;
@@ -72,19 +32,17 @@ void mmap_and_read(int fd)
 	struct rusage ru;
 	size_t buffer_sz;
 	int lu, zflg = 1;
-	const unsigned int N = 1048576;
-	const unsigned int bytes = N * sizeof(int);
 
 	gettimeofday(&t0, NULL);
 
 	fcntl(fd, F_SETFL, O_NDELAY);
-	buffer = (unsigned char*)mmap_large_buffer(chunk_size, &buffer_sz);
+	buffer = (unsigned char*)mmap_large_buffer(CHUNK_SIZE, &buffer_sz, map_align);
 
 	if (buffer == (void *)-1) {
 		perror("mmap");
 		goto error;
 	}
-	raddr = mmap(NULL, chunk_size + map_align, PROT_READ, MAP_SHARED, fd, 0);
+	raddr = mmap(NULL, CHUNK_SIZE + map_align, PROT_READ, MAP_SHARED, fd, 0);
 	if (raddr == (void *)-1) {
 		perror("mmap");
 		zflg = 0;
@@ -103,7 +61,7 @@ void mmap_and_read(int fd)
 
 			memset(&zc, 0, sizeof(zc));
 			zc.address = (__u64)((unsigned long)addr);
-			zc.length = min(chunk_size, FILE_SZ - total);
+			zc.length = min(CHUNK_SIZE, size - total);
 
 			res = getsockopt(fd, IPPROTO_TCP, TCP_ZEROCOPY_RECEIVE,
 					 &zc, &zc_len);
@@ -111,18 +69,21 @@ void mmap_and_read(int fd)
 				break;
 
 			if (zc.length) {
-				assert(zc.length <= chunk_size);
+				assert(zc.length <= CHUNK_SIZE);
 				total_mmap += zc.length;
 				/* It is more efficient to unmap the pages right now,
 				 * instead of doing this in next TCP_ZEROCOPY_RECEIVE.
 				 */
-				cudaMemcpy(device_array + total, addr, zc.length, cudaMemcpyHostToDevice);
+				if (copy_from_user_buffer)
+					cudaMemcpy(device_array + total, buffer, zc.length, cudaMemcpyHostToDevice);
+				else
+					cudaMemcpy(device_array + total, addr, zc.length, cudaMemcpyHostToDevice);
 				madvise(addr, zc.length, MADV_DONTNEED);
 				total += zc.length;
 			}
 			if (zc.recv_skip_hint) {
-				assert(zc.recv_skip_hint <= chunk_size);
-				int read_size = min(zc.recv_skip_hint, FILE_SZ - total)
+				assert(zc.recv_skip_hint <= CHUNK_SIZE);
+				int read_size = min(zc.recv_skip_hint, size - total);
 				lu = read(fd, buffer, read_size);
 				cudaMemcpy(device_array + total, buffer, read_size, cudaMemcpyHostToDevice);
 				if (lu > 0) 
@@ -133,8 +94,8 @@ void mmap_and_read(int fd)
 			continue;
 		}
 		sub = 0;
-		while (sub < chunk_size) {
-			int read_size = min(chunk_size - sub, FILE_SZ - total);
+		while (sub < CHUNK_SIZE) {
+			int read_size = min(CHUNK_SIZE - sub, size - total);
 			lu = read(fd, buffer + sub, read_size);
 			cudaMemcpy(device_array + total, buffer, read_size, cudaMemcpyHostToDevice);
 			if (lu == 0)
@@ -175,33 +136,13 @@ error:
 	munmap(buffer, buffer_sz);
 	close(fd);
 	if (zflg)
-		munmap(raddr, chunk_size + map_align);
+		munmap(raddr, CHUNK_SIZE + map_align);
 	return;
-}
-
-static unsigned long default_huge_page_size(void)
-{
-	FILE *f = fopen("/proc/meminfo", "r");
-	unsigned long hps = 0;
-	size_t linelen = 0;
-	char *line = NULL;
-
-	if (!f)
-		return 0;
-	while (getline(&line, &linelen, f) > 0) {
-		if (sscanf(line, "Hugepagesize:       %lu kB", &hps) == 1) {
-			hps <<= 10;
-			break;
-		}
-	}
-	free(line);
-	fclose(f);
-	return hps;
 }
 
 static void do_accept(int fdlisten)
 {
-	int rcvlowat = chunk_size;
+	int rcvlowat = CHUNK_SIZE;
 	struct sockaddr_in addr;
 	socklen_t addrlen = sizeof(addr);
 	int fd;
@@ -213,22 +154,24 @@ static void do_accept(int fdlisten)
 	fd = accept(fdlisten, (struct sockaddr *)&addr, &addrlen);
 	if (fd == -1) {
 		perror("accept");
-		continue;
+		exit(1);
 	}
 	mmap_and_read(fd);
 }
 
 // param bytes should be set as SIZE * sizeof(typeof(SIZE))
 // If its type is not int, change its type here and global size variable as well
-void receive(const unsigned int bytes){
+void receive(const unsigned long long bytes){
 	int on = 1;
 	char *host = NULL;
-	struct sockaddr_storage listenaddr, addr;
+	struct sockaddr_storage listenaddr;
 	int mss = MSS;
+	static int cfg_family = AF_INET6;
+	static socklen_t cfg_alen = sizeof(struct sockaddr_in6);
 
 	// Allocating array in the device
 	cudaMalloc((int**)&device_array, bytes);
-	size = bytes
+	size = bytes;
 
 	map_align = default_huge_page_size();
 	/* if really /proc/meminfo is not helping,
@@ -260,5 +203,20 @@ void receive(const unsigned int bytes){
 		perror("listen");
 		exit(1);
 	}
-	do_accept(fdlisten, bytes);
+	do_accept(fdlisten);
+}
+
+int main(int argc, char *argv[]){
+	int c;
+	while ((c = getopt(argc, argv, "46p:svr:w:H:zxkP:M:C:a:i:u")) != -1) {
+		switch (c) {
+		case 'u':
+			copy_from_user_buffer = 1;
+			break;
+		default:
+			exit(1);
+		}
+	}
+	receive(FILE_SZ);
+	return 0;
 }
