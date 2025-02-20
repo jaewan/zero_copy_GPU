@@ -84,13 +84,11 @@ static void print_statistics(const char* test_name) {
 	printf("=============================\n\n");
 }
 
-void mmap_and_read(int fd)
+void mmap_and_read(int fd, unsigned char *buffer)
 {
 	void *raddr = NULL;
 	void *addr = NULL;
 	void *device_ptr = NULL;
-	unsigned char *buffer = NULL;
-	size_t buffer_sz;
 	int lu;
 	bool using_registered_memory = false;
 
@@ -98,20 +96,12 @@ void mmap_and_read(int fd)
 	memset(&stats, 0, sizeof(stats));
 	gettimeofday(&stats.start_time, NULL);
 
-	// Initialize streams if needed
-	init_streams();
-
 	fcntl(fd, F_SETFL, O_NDELAY);
-	buffer = (unsigned char*)mmap_large_buffer(CHUNK_SIZE, &buffer_sz, map_align);
-	if (buffer == (void *)-1) {
-		perror("mmap");
-		goto error;
-	}
 
 	if (config.use_zerocopy_tcp) {
 		raddr = mmap(NULL, CHUNK_SIZE + map_align, PROT_READ, MAP_SHARED, fd, 0);
 		if (raddr == (void *)-1) {
-			perror("mmap");
+			perror("mmap kernel network buffer failed");
 			config.use_zerocopy_tcp = false;
 		} else {
 			addr = ALIGN_PTR_UP(raddr, map_align);
@@ -129,6 +119,7 @@ void mmap_and_read(int fd)
 		}
 	}
 
+	std::cout << "Start Receiving Data via network" << std::endl;
 	while (1) {
 		if (config.use_zerocopy_tcp) {
 			struct tcp_zerocopy_receive zc;
@@ -138,8 +129,10 @@ void mmap_and_read(int fd)
 			zc.address = (__u64)((unsigned long)addr);
 			zc.length = min(CHUNK_SIZE, size - stats.total_bytes);
 
-			if (getsockopt(fd, IPPROTO_TCP, TCP_ZEROCOPY_RECEIVE, &zc, &zc_len) == -1)
+			if (getsockopt(fd, IPPROTO_TCP, TCP_ZEROCOPY_RECEIVE, &zc, &zc_len) == -1){
+				std::cout << " !!! TCP_ZEROCOPY_RECEIVE not set" << std::endl;
 				break;
+			}
 
 			if (zc.length) {
 				stats.total_mmap_bytes += zc.length;
@@ -250,74 +243,72 @@ end:
 
 	print_statistics(test_name);
 
-error:
 	if (using_registered_memory) {
 		cudaHostUnregister(addr);
 	}
-	cleanup_streams();
-	munmap(buffer, buffer_sz);
-	close(fd);
 	if (config.use_zerocopy_tcp && raddr)
 		munmap(raddr, CHUNK_SIZE + map_align);
 }
 
 
 static void do_accept(int fdlisten) {
-    int rcvlowat = CHUNK_SIZE;
-    struct sockaddr_in addr;
-    socklen_t addrlen = sizeof(addr);
-    int fd;
-    if (setsockopt(fdlisten, SOL_SOCKET, SO_RCVLOWAT, &rcvlowat, sizeof(rcvlowat)) == -1) {
-        perror("setsockopt SO_RCVLOWAT");
-    }
+	int rcvlowat = CHUNK_SIZE;
+	unsigned char *buffer = NULL;
+	size_t buffer_sz;
+	struct sockaddr_in addr;
+	socklen_t addrlen = sizeof(addr);
 
-    fd = accept(fdlisten, (struct sockaddr *)&addr, &addrlen);
-    if (fd == -1) {
-        perror("accept");
-        exit(1);
-    }
-    mmap_and_read(fd);
+	if (setsockopt(fdlisten, SOL_SOCKET, SO_RCVLOWAT, &rcvlowat, sizeof(rcvlowat)) == -1) {
+		perror("setsockopt SO_RCVLOWAT");
+	}
+	buffer = (unsigned char*)mmap_large_buffer(CHUNK_SIZE, &buffer_sz, map_align);
+	if (buffer == (void *)-1) {
+		perror("mmap");
+		return;
+	}
+
+	int fd = accept(fdlisten, (struct sockaddr *)&addr, &addrlen);
+	if (fd == -1) {
+		perror("accept");
+		exit(1);
+	}
+
+	mmap_and_read(fd, buffer);
+
+	close(fd);
+	munmap(buffer, buffer_sz);
 }
 
 void receive(const unsigned long long bytes) {
-    int on = 1;
-    char *host = NULL;
-    struct sockaddr_storage listenaddr;
-    int mss = MSS;
-    static int cfg_family = AF_INET6;
-    static socklen_t cfg_alen = sizeof(struct sockaddr_in6);
+	int on = 1;
+	struct sockaddr_storage listenaddr;
+	static socklen_t cfg_alen = sizeof(struct sockaddr_in6);
 
-    // Allocate array in the device
-    checkCuda(cudaMalloc((int **)&device_array, bytes), "Allocating GPU memory");
-    size = bytes;
+	// Allocate array in the device
+	checkCuda(cudaMalloc((int **)&device_array, bytes), "Allocating GPU memory");
+	size = bytes;
 
-    map_align = default_huge_page_size();
-    if (!map_align)
-        map_align = 2 * 1024 * 1024;
+	map_align = default_huge_page_size();
+	if (!map_align)
+		map_align = 2 * 1024 * 1024;
 
-    int fdlisten = socket(cfg_family, SOCK_STREAM, 0);
-    if (fdlisten == -1) {
-        perror("socket");
-        exit(1);
-    }
-    setsockopt(fdlisten, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
+	int fd = create_new_socket(listenaddr);
 
-    setup_sockaddr(cfg_family, host, &listenaddr);
-
-    if (mss &&
-        setsockopt(fdlisten, IPPROTO_TCP, TCP_MAXSEG, &mss, sizeof(mss)) == -1) {
-        perror("setsockopt TCP_MAXSEG");
-        exit(1);
-    }
-    if (bind(fdlisten, (const struct sockaddr *)&listenaddr, cfg_alen) == -1) {
-        perror("bind");
-        exit(1);
-    }
-    if (listen(fdlisten, 128) == -1) {
-        perror("listen");
-        exit(1);
-    }
-    do_accept(fdlisten);
+	if (config.use_zerocopy_tcp){
+		if(setsockopt(fd, IPPROTO_TCP, TCP_ZEROCOPY_RECEIVE, &on, sizeof(on)) == -1) {
+			perror("setsockopt TCP_ZEROCOPY_RECEIVE failed");
+			// Zero-copy TCP is likely not available.  Handle accordingly.
+		}
+	}
+	if (bind(fd, (const struct sockaddr *)&listenaddr, cfg_alen) == -1) {
+		perror("bind");
+		exit(1);
+	}
+	if (listen(fd, 128) == -1) {
+		perror("listen");
+		exit(1);
+	}
+	do_accept(fd);
 }
 
 // Modified main function to support different configurations
@@ -333,7 +324,7 @@ int main(int argc, char *argv[]) {
 	while ((c = getopt(argc, argv, "zras:")) != -1) {
 		switch (c) {
 			case 'z':
-				config.use_zerocopy_tcp = true;
+				config.use_zerocopy_tcp = false;
 				break;
 			case 'r':
 				config.use_cuda_register = true;
@@ -346,7 +337,7 @@ int main(int argc, char *argv[]) {
 				break;
 			default:
 				fprintf(stderr, "Usage: %s [-z] [-r] [-a] [-s num_streams]\n"
-						"  -z: Enable TCP zero-copy (default: on)\n"
+						"  -z: Disable TCP zero-copy Receive (default: off)\n"
 						"  -r: Enable CUDA memory registration\n"
 						"  -a: Enable async transfer\n"
 						"  -s: Number of CUDA streams (default: 4)\n",
@@ -355,6 +346,9 @@ int main(int argc, char *argv[]) {
 		}
 	}
 
+	// Initialize streams only when async transfer is enabled
+	init_streams();
 	receive(FILE_SZ);
+	cleanup_streams();
 	return 0;
 }

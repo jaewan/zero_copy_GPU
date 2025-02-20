@@ -1,6 +1,10 @@
 # zero_copy_GPU
-Zero copy data movement from network to NVIDIA GPUs using zero copy TCP in userspace
-receive.cu receives data from network and send it to the GPU using zero-copy
+Zero copy data transfer from client via commodity network to NVIDIA GPUs using zero copy TCP.
+
+## Requirements
+Requires Linux Kernel >= 4.18
+CONFIG_TCP_ZERO_COPY_TRANSFER_COMPLETION_NOTIFICATION must be on
+First run check_zerocopy.sh
 
 How to compile
 -----------------

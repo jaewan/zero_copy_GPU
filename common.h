@@ -19,6 +19,8 @@
 #include <poll.h>
 #include <linux/tcp.h>
 #include <assert.h>
+#include <iostream>
+#include <chrono>
 
 #ifndef MSG_ZEROCOPY
 #define MSG_ZEROCOPY    0x4000000
@@ -32,7 +34,7 @@
 #define ALIGN_PTR_UP(p, ptr_align_to)	((typeof(p))ALIGN_UP((unsigned long)(p), ptr_align_to))
 
 #define MSS 4108
-#define FILE_SZ (1ULL << 35)
+#define FILE_SZ (1ULL << 30)
 #define CFG_PORT 8787
 #define CHUNK_SIZE 524288
 
@@ -40,6 +42,7 @@ void *mmap_large_buffer(size_t need, size_t *allocated, size_t map_align);
 unsigned long default_huge_page_size(void);
 void setup_sockaddr(int domain, const char *str_addr,
 			   struct sockaddr_storage *sockaddr);
+int create_new_socket(struct sockaddr_storage &addr);
 
 // Change this size according to PCIe bandwidth. It is set in common.c
 extern size_t chunk_size;

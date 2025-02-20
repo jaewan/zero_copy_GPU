@@ -73,3 +73,27 @@ void setup_sockaddr(int domain, const char *str_addr,
 	}
 }
 
+int create_new_socket(struct sockaddr_storage &addr){
+	static int cfg_family = AF_INET6;
+	char *host = NULL;
+	int mss = MSS, on = 1;
+
+	int fd = socket(cfg_family, SOCK_STREAM, 0);
+
+	if (fd == -1) {
+		perror("socket");
+		exit(1);
+	}
+	setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
+
+	setup_sockaddr(cfg_family, host, &addr);
+
+	if (mss &&
+	    setsockopt(fd, IPPROTO_TCP, TCP_MAXSEG, &mss, sizeof(mss)) == -1) {
+		perror("setsockopt TCP_MAXSEG");
+		exit(1);
+	}
+	
+	return fd;
+}
+
